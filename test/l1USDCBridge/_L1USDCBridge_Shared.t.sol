@@ -77,7 +77,7 @@ contract L1USDCBridgeTest is Test {
 
     uint256 isWithdrawalFinalizedStorageLocation = uint256(8 - 1 + (1 + 49) + 0 + (1 + 49) + 50 + 1 + 50);
 
-    function setUp() public {
+    function setUp() public virtual {
         owner = makeAddr("owner");
         admin = makeAddr("admin");
         proxyAdmin = makeAddr("proxyAdmin");
