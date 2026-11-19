@@ -68,6 +68,10 @@ contract L1USDCBridge is IL1SharedBridge, ReentrancyGuard, Ownable2StepUpgradeab
     /// @dev The pending admin, i.e. the candidate to the admin role.
     address public pendingAdmin;
 
+    /// @dev Chains for which the owner closed the bridge with `shutdownChain`. Deposits, withdrawals and
+    /// failed-deposit claims revert for them.
+    mapping(uint256 chainId => bool isShutdown) public override isChainShutdown;
+
     /// @notice Checks that the message sender is the bridgehub.
     modifier onlyBridgehub() {
         require(msg.sender == address(BRIDGE_HUB), "USDC-ShB not BH");
@@ -171,6 +175,7 @@ contract L1USDCBridge is IL1SharedBridge, ReentrancyGuard, Ownable2StepUpgradeab
         returns (L2TransactionRequestTwoBridgesInner memory request)
     {
         require(_l2Value == 0, "USDC-ShB: l2Value must be 0");
+        _requireChainNotShutdown(_chainId);
         address l2Bridge = l2BridgeAddress[_chainId];
         require(l2Bridge != address(0), "USDC-ShB l2 bridge not deployed");
 
@@ -270,6 +275,7 @@ contract L1USDCBridge is IL1SharedBridge, ReentrancyGuard, Ownable2StepUpgradeab
         uint16 _l2TxNumberInBatch,
         bytes32[] calldata _merkleProof
     ) internal nonReentrant whenNotPaused {
+        _requireChainNotShutdown(_chainId);
         bool proofValid = BRIDGE_HUB.proveL1ToL2TransactionStatus({
             _chainId: _chainId,
             _l2TxHash: _l2TxHash,
@@ -343,6 +349,7 @@ contract L1USDCBridge is IL1SharedBridge, ReentrancyGuard, Ownable2StepUpgradeab
         bytes calldata _message,
         bytes32[] calldata _merkleProof
     ) internal nonReentrant whenNotPaused returns (address l1Receiver, address l1Token, uint256 amount) {
+        _requireChainNotShutdown(_chainId);
         require(!isWithdrawalFinalized[_chainId][_l2BatchNumber][_l2MessageIndex], "Withdrawal is already finalized");
         isWithdrawalFinalized[_chainId][_l2BatchNumber][_l2MessageIndex] = true;
 
@@ -421,6 +428,36 @@ contract L1USDCBridge is IL1SharedBridge, ReentrancyGuard, Ownable2StepUpgradeab
         } else {
             revert("USDC-ShB Incorrect message function selector");
         }
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                            CHAIN SHUTDOWN
+    //////////////////////////////////////////////////////////////*/
+
+    /// @inheritdoc IL1SharedBridge
+    /// @dev Irreversible. Other chains' balances are not affected, unlike with `pause`.
+    /// @dev Deposits still in flight to the chain, withdrawals not yet finalized and failed deposits not yet
+    /// claimed can no longer be paid out by the bridge, so `_recipient` has to cover them too.
+    /// @dev Works while the bridge is paused, so a chain can be closed without unpausing the others.
+    function shutdownChain(uint256 _chainId, address _recipient) external onlyOwner nonReentrant {
+        _requireChainNotShutdown(_chainId);
+        require(_recipient != address(0), "USDC-ShB: recipient 0");
+        require(l2BridgeAddress[_chainId] != address(0), "USDC-ShB: l2 bridge not yet set");
+
+        isChainShutdown[_chainId] = true;
+        uint256 amount = chainBalance[_chainId][L1_USDC_TOKEN];
+        chainBalance[_chainId][L1_USDC_TOKEN] = 0;
+
+        if (amount != 0) {
+            IERC20(L1_USDC_TOKEN).safeTransfer(_recipient, amount);
+        }
+
+        emit ChainShutdown(_chainId, _recipient, amount);
+    }
+
+    /// @dev Reverts if the owner closed the bridge for `_chainId`.
+    function _requireChainNotShutdown(uint256 _chainId) internal view {
+        require(!isChainShutdown[_chainId], "USDC-ShB: chain is shut down");
     }
 
     /*//////////////////////////////////////////////////////////////
