@@ -25,6 +25,13 @@ import {
 } from "@era-contracts/l1-contracts/contracts/bridgehub/IBridgehub.sol";
 import {IGetters} from "@era-contracts/l1-contracts/contracts/state-transition/chain-interfaces/IGetters.sol";
 import {L2_BASE_TOKEN_SYSTEM_CONTRACT_ADDR} from "@era-contracts/l1-contracts/contracts/common/L2ContractAddresses.sol";
+import {
+    IBridgehubAssetRouter,
+    IL1AssetRouterNativeTokenVault,
+    IL1NativeTokenVaultAssetTracker,
+    IL1AssetTrackerShutdown,
+    IShutdownClaimDistributor
+} from "./interfaces/IChainShutdown.sol";
 
 /// @author Sophon
 /// @notice Forked from ML L1USDCBridge contract
@@ -71,6 +78,13 @@ contract L1USDCBridge is IL1SharedBridge, ReentrancyGuard, Ownable2StepUpgradeab
     /// @notice Checks that the message sender is the bridgehub.
     modifier onlyBridgehub() {
         require(msg.sender == address(BRIDGE_HUB), "USDC-ShB not BH");
+        _;
+    }
+
+    /// @notice Checks that the governance has not shut the chain down in the L1 asset tracker. After the shutdown the
+    /// chain's funds can only leave the bridge through `sendShutdownChainFunds`.
+    modifier whenChainNotShutdown(uint256 _chainId) {
+        require(!_l1AssetTracker().isChainShutdown(_chainId), "USDC-ShB: chain is shut down");
         _;
     }
 
@@ -145,7 +159,11 @@ contract L1USDCBridge is IL1SharedBridge, ReentrancyGuard, Ownable2StepUpgradeab
     /// an existing chain.
     /// @param _chainId The chain ID for which the l2Bridge address is being initialized.
     /// @param _l2BridgeAddress The address of the L2 bridge contract.
-    function reinitializeChainGovernance(uint256 _chainId, address _l2BridgeAddress) external onlyOwner {
+    function reinitializeChainGovernance(uint256 _chainId, address _l2BridgeAddress)
+        external
+        onlyOwner
+        whenChainNotShutdown(_chainId)
+    {
         require(l2BridgeAddress[_chainId] != address(0), "USDC-ShB: l2 bridge not yet set");
         l2BridgeAddress[_chainId] = _l2BridgeAddress;
     }
@@ -168,6 +186,7 @@ contract L1USDCBridge is IL1SharedBridge, ReentrancyGuard, Ownable2StepUpgradeab
         override
         onlyBridgehub
         whenNotPaused
+        whenChainNotShutdown(_chainId)
         returns (L2TransactionRequestTwoBridgesInner memory request)
     {
         require(_l2Value == 0, "USDC-ShB: l2Value must be 0");
@@ -244,7 +263,7 @@ contract L1USDCBridge is IL1SharedBridge, ReentrancyGuard, Ownable2StepUpgradeab
         uint256 _l2MessageIndex,
         uint16 _l2TxNumberInBatch,
         bytes32[] calldata _merkleProof
-    ) external override {
+    ) external override whenChainNotShutdown(_chainId) {
         _claimFailedDeposit({
             _chainId: _chainId,
             _depositSender: _depositSender,
@@ -315,7 +334,7 @@ contract L1USDCBridge is IL1SharedBridge, ReentrancyGuard, Ownable2StepUpgradeab
         uint16 _l2TxNumberInBatch,
         bytes calldata _message,
         bytes32[] calldata _merkleProof
-    ) external override {
+    ) external override whenChainNotShutdown(_chainId) {
         // Note: new withdraws are all recorded here, so double withdrawing them is not possible.
         _finalizeWithdrawal({
             _chainId: _chainId,
@@ -421,6 +440,45 @@ contract L1USDCBridge is IL1SharedBridge, ReentrancyGuard, Ownable2StepUpgradeab
         } else {
             revert("USDC-ShB Incorrect message function selector");
         }
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                            CHAIN SHUTDOWN
+    //////////////////////////////////////////////////////////////*/
+
+    /// @inheritdoc IL1SharedBridge
+    /// @dev The funds go to the distributor that the L1 asset tracker records for the chain.
+    /// @dev Reverts until that distributor is installed (its `MERKLE_ROOT()` is non-zero). This gives the governance
+    /// time to replace the distributor if needed: the funds then go to the new one.
+    /// @dev Only USDC is sent: `bridgehubDeposit` is the only place that increases `chainBalance`, and it only
+    /// accepts `L1_USDC_TOKEN`.
+    function sendShutdownChainFunds(uint256 _chainId)
+        external
+        override
+        nonReentrant
+        whenNotPaused
+        returns (uint256 amount)
+    {
+        IL1AssetTrackerShutdown assetTracker = _l1AssetTracker();
+        require(assetTracker.isChainShutdown(_chainId), "USDC-ShB: chain is not shut down");
+        (, address distributor) = assetTracker.shutdownChainInfo(_chainId);
+        require(IShutdownClaimDistributor(distributor).MERKLE_ROOT() != bytes32(0), "USDC-ShB: distributor not set");
+
+        amount = chainBalance[_chainId][L1_USDC_TOKEN];
+        require(amount != 0, "USDC-ShB: no chain balance");
+        chainBalance[_chainId][L1_USDC_TOKEN] = 0;
+
+        IERC20(L1_USDC_TOKEN).safeTransfer(distributor, amount);
+
+        emit ShutdownChainFundsSent(_chainId, distributor, amount);
+    }
+
+    /// @dev The L1 asset tracker of the ecosystem the bridge belongs to, read through the Bridgehub so it follows
+    /// the ecosystem's contracts.
+    function _l1AssetTracker() internal view returns (IL1AssetTrackerShutdown) {
+        address assetRouter = IBridgehubAssetRouter(address(BRIDGE_HUB)).assetRouter();
+        address nativeTokenVault = IL1AssetRouterNativeTokenVault(assetRouter).nativeTokenVault();
+        return IL1AssetTrackerShutdown(IL1NativeTokenVaultAssetTracker(nativeTokenVault).l1AssetTracker());
     }
 
     /*//////////////////////////////////////////////////////////////

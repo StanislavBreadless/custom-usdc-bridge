@@ -9,6 +9,8 @@ import {TransparentUpgradeableProxy} from "@openzeppelin/contracts/proxy/transpa
 import {L1USDCBridge} from "../../src/L1USDCBridge.sol";
 import {IBridgehub} from "@era-contracts/l1-contracts/contracts/bridgehub/IBridgehub.sol";
 import {TestnetERC20Token} from "@era-contracts/l1-contracts/contracts/dev-contracts/TestnetERC20Token.sol";
+import {IBridgehubAssetRouter} from "../../src/interfaces/IChainShutdown.sol";
+import {MockL1AssetTracker} from "../mocks/MockChainShutdown.sol";
 
 contract L1USDCBridgeTest is Test {
     using stdStorage for StdStorage;
@@ -54,6 +56,7 @@ contract L1USDCBridgeTest is Test {
     address l1WethAddress;
     address l2USDCBridge;
     TestnetERC20Token token;
+    MockL1AssetTracker assetTracker;
     uint256 eraPostUpgradeFirstBatch;
 
     address owner;
@@ -77,7 +80,7 @@ contract L1USDCBridgeTest is Test {
 
     uint256 isWithdrawalFinalizedStorageLocation = uint256(8 - 1 + (1 + 49) + 0 + (1 + 49) + 50 + 1 + 50);
 
-    function setUp() public {
+    function setUp() public virtual {
         owner = makeAddr("owner");
         admin = makeAddr("admin");
         proxyAdmin = makeAddr("proxyAdmin");
@@ -102,6 +105,13 @@ contract L1USDCBridgeTest is Test {
         eraErc20BridgeAddress = makeAddr("eraErc20BridgeAddress");
 
         token = new TestnetERC20Token("TestnetERC20Token", "TET", 18);
+        // The bridge reads the chain shutdown state from the asset tracker it finds through the Bridgehub.
+        assetTracker = new MockL1AssetTracker();
+        vm.mockCall(
+            bridgehubAddress,
+            abi.encodeWithSelector(IBridgehubAssetRouter.assetRouter.selector),
+            abi.encode(address(assetTracker))
+        );
         sharedBridgeImpl = new L1USDCBridge({_l1UsdcAddress: address(token), _bridgehub: IBridgehub(bridgehubAddress)});
         TransparentUpgradeableProxy sharedBridgeProxy = new TransparentUpgradeableProxy(
             address(sharedBridgeImpl), proxyAdmin, abi.encodeWithSelector(L1USDCBridge.initialize.selector, owner)

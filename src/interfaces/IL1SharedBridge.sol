@@ -53,6 +53,9 @@ interface IL1SharedBridge {
         uint256 indexed chainId, address indexed to, address indexed l1Token, uint256 amount
     );
 
+    /// @notice The USDC balance of a chain that the governance shut down was sent to the chain's claim distributor.
+    event ShutdownChainFundsSent(uint256 indexed chainId, address indexed distributor, uint256 amount);
+
     function isWithdrawalFinalized(uint256 _chainId, uint256 _l2BatchNumber, uint256 _l2MessageIndex)
         external
         view
@@ -69,6 +72,12 @@ interface IL1SharedBridge {
         uint16 _l2TxNumberInBatch,
         bytes32[] calldata _merkleProof
     ) external;
+
+    /// @notice Sends the whole USDC balance that the bridge holds for a shut down chain to the chain's claim
+    /// distributor, as recorded in the L1 asset tracker. Callable by anyone.
+    /// @param _chainId The shut down chain.
+    /// @return amount The amount sent.
+    function sendShutdownChainFunds(uint256 _chainId) external returns (uint256 amount);
 
     function finalizeWithdrawal(
         uint256 _chainId,
