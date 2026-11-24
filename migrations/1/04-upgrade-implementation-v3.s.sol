@@ -7,8 +7,11 @@ import {IBridgehub} from "@era-contracts/l1-contracts/contracts/bridgehub/IBridg
 import {ITransparentUpgradeableProxy, ProxyAdmin} from "@openzeppelin/contracts/proxy/transparent/ProxyAdmin.sol";
 import {DeploymentUtils} from "../../utils/DeploymentUtils.sol";
 
-// Deploys the V3 implementation (adds `shutdownChain`) and prints the governance call that upgrades the proxy to it.
-// V3 only appends a mapping to the storage, so no reinitializer is needed.
+// Deploys the V3 implementation and prints the governance call that upgrades the proxy to it.
+// V3 reads the chain shutdown state from the L1 asset tracker (`isChainShutdown`, `shutdownChainInfo`), so the
+// upgrade must be executed together with the asset tracker upgrade that adds them: until then every deposit,
+// withdrawal and failed-deposit claim of the new implementation reverts.
+// V3 does not change the storage layout, so no reinitializer is needed.
 // Command to test:
 // source .env && forge script ./migrations/1/04-upgrade-implementation-v3.s.sol --rpc-url ethereum
 contract MigrateL1USDCBridgeV3 is Script, DeploymentUtils {

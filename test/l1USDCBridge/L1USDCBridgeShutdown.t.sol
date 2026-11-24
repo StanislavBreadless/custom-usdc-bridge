@@ -2,23 +2,31 @@
 pragma solidity 0.8.24;
 
 import {L1USDCBridgeTest} from "./_L1USDCBridge_Shared.t.sol";
+import {MockShutdownClaimDistributor} from "../mocks/MockChainShutdown.sol";
 
 import {ETH_TOKEN_ADDRESS} from "@era-contracts/l1-contracts/contracts/common/Config.sol";
 import {IBridgehub} from "@era-contracts/l1-contracts/contracts/bridgehub/IBridgehub.sol";
 import {L2Message, TxStatus} from "@era-contracts/l1-contracts/contracts/common/Messaging.sol";
 import {IL1ERC20Bridge} from "@era-contracts/l1-contracts/contracts/bridge/interfaces/IL1ERC20Bridge.sol";
+import {TestnetERC20Token} from "@era-contracts/l1-contracts/contracts/dev-contracts/TestnetERC20Token.sol";
 
-/// @notice Tests for `shutdownChain`, which closes the bridge for one chain and moves its USDC out.
-/// @dev The bridgehub is mocked (as in the other unit tests) because the bridge only uses it for `baseToken` and
-/// proofs. Chain balances are built with real `bridgehubDeposit` calls.
+/// @notice Tests for chains shut down in the L1 asset tracker: the bridge stops serving them, and
+/// `sendShutdownChainFunds` sends their balance to the distributor the asset tracker records.
+/// @dev The asset tracker and the distributor are mocks (see `MockChainShutdown.sol`): the shutdown itself is done
+/// by the era-contracts governance flow, which these unit tests isolate the bridge from. The bridgehub is mocked as in
+/// the other unit tests. Chain balances are built with real `bridgehubDeposit` calls.
 contract L1USDCBridgeShutdownTest is L1USDCBridgeTest {
-    event ChainShutdown(uint256 indexed chainId, address indexed recipient, uint256 amount);
+    event ShutdownChainFundsSent(
+        uint256 indexed chainId, address indexed l1Token, address indexed distributor, uint256 amount
+    );
 
-    address recipient;
+    address chainAdmin;
+    MockShutdownClaimDistributor distributor;
 
     function setUp() public override {
         super.setUp();
-        recipient = makeAddr("recipient");
+        chainAdmin = makeAddr("chainAdmin");
+        distributor = new MockShutdownClaimDistributor();
         vm.mockCall(
             bridgehubAddress, abi.encodeWithSelector(IBridgehub.baseToken.selector), abi.encode(ETH_TOKEN_ADDRESS)
         );
@@ -34,6 +42,12 @@ contract L1USDCBridgeShutdownTest is L1USDCBridgeTest {
         token.approve(address(sharedBridge), _amount);
         vm.prank(bridgehubAddress);
         sharedBridge.bridgehubDeposit(_chainId, alice, 0, abi.encode(address(token), _amount, bob));
+    }
+
+    /// @dev Shuts the chain down in the asset tracker and installs its distributor.
+    function _shutdownAndInstall(uint256 _chainId) internal {
+        assetTracker.shutdownChain(_chainId, chainAdmin, address(distributor));
+        distributor.install(keccak256("root"));
     }
 
     function _withdrawalMessage(uint256 _amount) internal view returns (bytes memory) {
@@ -69,110 +83,122 @@ contract L1USDCBridgeShutdownTest is L1USDCBridgeTest {
     }
 
     /*//////////////////////////////////////////////////////////////
-                            HAPPY PATHS
+                    sendShutdownChainFunds: HAPPY PATHS
     //////////////////////////////////////////////////////////////*/
 
-    function test_shutdownChain_movesChainBalance() public {
+    /// @dev Anyone can send the funds: the destination is fixed by the asset tracker.
+    function test_sendShutdownChainFunds_sendsChainBalanceToDistributor() public {
         _deposit(chainId, amount);
         _deposit(eraChainId, 2 * amount);
+        _shutdownAndInstall(chainId);
 
         vm.expectEmit(true, true, true, true, address(sharedBridge));
-        emit ChainShutdown(chainId, recipient, amount);
-        vm.prank(owner);
-        sharedBridge.shutdownChain(chainId, recipient);
+        emit ShutdownChainFundsSent(chainId, address(token), address(distributor), amount);
+        vm.prank(alice);
+        uint256 sent = sharedBridge.sendShutdownChainFunds(chainId, address(token));
 
-        assertTrue(sharedBridge.isChainShutdown(chainId));
+        assertEq(sent, amount);
+        assertEq(token.balanceOf(address(distributor)), amount);
         assertEq(sharedBridge.chainBalance(chainId, address(token)), 0);
-        assertEq(token.balanceOf(recipient), amount);
         // The other chain is not affected.
-        assertFalse(sharedBridge.isChainShutdown(eraChainId));
         assertEq(sharedBridge.chainBalance(eraChainId, address(token)), 2 * amount);
         assertEq(token.balanceOf(address(sharedBridge)), 2 * amount);
     }
 
-    function test_shutdownChain_zeroBalance() public {
-        vm.expectEmit(true, true, true, true, address(sharedBridge));
-        emit ChainShutdown(chainId, recipient, 0);
-        vm.prank(owner);
-        sharedBridge.shutdownChain(chainId, recipient);
-
-        assertTrue(sharedBridge.isChainShutdown(chainId));
-        assertEq(token.balanceOf(recipient), 0);
-    }
-
-    /// @dev The owner can close a chain while the bridge is paused, so the other chains don't have to be unpaused.
-    function test_shutdownChain_whilePaused() public {
+    /// @dev Until the distributor is installed the governance can replace it in the asset tracker, and the funds
+    /// follow the replacement.
+    function test_sendShutdownChainFunds_followsReplacedDistributor() public {
         _deposit(chainId, amount);
-        vm.startPrank(owner);
-        sharedBridge.pause();
-        sharedBridge.shutdownChain(chainId, recipient);
-        vm.stopPrank();
+        assetTracker.shutdownChain(chainId, chainAdmin, address(distributor));
 
-        assertTrue(sharedBridge.paused());
-        assertTrue(sharedBridge.isChainShutdown(chainId));
-        assertEq(token.balanceOf(recipient), amount);
+        MockShutdownClaimDistributor newDistributor = new MockShutdownClaimDistributor();
+        assetTracker.shutdownChain(chainId, chainAdmin, address(newDistributor));
+        newDistributor.install(keccak256("root"));
+
+        sharedBridge.sendShutdownChainFunds(chainId, address(token));
+
+        assertEq(token.balanceOf(address(newDistributor)), amount);
+        assertEq(token.balanceOf(address(distributor)), 0);
     }
 
-    /// @dev Only the chain's own balance moves: tokens sent to the bridge directly are not attributed to any chain.
-    function test_shutdownChain_ignoresUnaccountedTokens() public {
+    /// @dev Only the chain's accounted balance is sent: tokens sent to the bridge directly belong to no chain.
+    function test_sendShutdownChainFunds_ignoresUnaccountedTokens() public {
         _deposit(chainId, amount);
         token.mint(address(sharedBridge), 7);
+        _shutdownAndInstall(chainId);
 
-        vm.prank(owner);
-        sharedBridge.shutdownChain(chainId, recipient);
+        sharedBridge.sendShutdownChainFunds(chainId, address(token));
 
-        assertEq(token.balanceOf(recipient), amount);
+        assertEq(token.balanceOf(address(distributor)), amount);
         assertEq(token.balanceOf(address(sharedBridge)), 7);
     }
 
-    function testFuzz_shutdownChain(uint128 _amount, uint128 _otherAmount) public {
+    function testFuzz_sendShutdownChainFunds(uint128 _amount, uint128 _otherAmount) public {
         vm.assume(_amount != 0 && _otherAmount != 0);
         _deposit(chainId, _amount);
         _deposit(eraChainId, _otherAmount);
+        _shutdownAndInstall(chainId);
 
-        vm.prank(owner);
-        sharedBridge.shutdownChain(chainId, recipient);
+        sharedBridge.sendShutdownChainFunds(chainId, address(token));
 
-        assertEq(token.balanceOf(recipient), _amount);
+        assertEq(token.balanceOf(address(distributor)), _amount);
         assertEq(sharedBridge.chainBalance(chainId, address(token)), 0);
         assertEq(sharedBridge.chainBalance(eraChainId, address(token)), _otherAmount);
         assertEq(token.balanceOf(address(sharedBridge)), _otherAmount);
     }
 
     /*//////////////////////////////////////////////////////////////
-                            UNHAPPY PATHS
+                    sendShutdownChainFunds: UNHAPPY PATHS
     //////////////////////////////////////////////////////////////*/
 
-    function test_shutdownChain_revertNotOwner() public {
-        vm.prank(admin);
-        vm.expectRevert("Ownable: caller is not the owner");
-        sharedBridge.shutdownChain(chainId, recipient);
+    function test_sendShutdownChainFunds_revertChainNotShutdown() public {
+        _deposit(chainId, amount);
 
-        vm.prank(alice);
-        vm.expectRevert("Ownable: caller is not the owner");
-        sharedBridge.shutdownChain(chainId, recipient);
-
-        assertFalse(sharedBridge.isChainShutdown(chainId));
+        vm.expectRevert("USDC-ShB: chain is not shut down");
+        sharedBridge.sendShutdownChainFunds(chainId, address(token));
+        assertEq(sharedBridge.chainBalance(chainId, address(token)), amount);
     }
 
-    function test_shutdownChain_revertZeroRecipient() public {
+    /// @dev While the distributor proxy still has the installer implementation its root is zero.
+    function test_sendShutdownChainFunds_revertDistributorNotInstalled() public {
+        _deposit(chainId, amount);
+        assetTracker.shutdownChain(chainId, chainAdmin, address(distributor));
+
+        vm.expectRevert("USDC-ShB: distributor not set");
+        sharedBridge.sendShutdownChainFunds(chainId, address(token));
+        assertEq(token.balanceOf(address(sharedBridge)), amount);
+    }
+
+    function test_sendShutdownChainFunds_revertTwice() public {
+        _deposit(chainId, amount);
+        _shutdownAndInstall(chainId);
+        sharedBridge.sendShutdownChainFunds(chainId, address(token));
+
+        vm.expectRevert("USDC-ShB: no chain balance");
+        sharedBridge.sendShutdownChainFunds(chainId, address(token));
+    }
+
+    /// @dev Any token can be passed, but deposits only accept USDC, so no other token has a chain balance, even if the
+    /// bridge holds some.
+    function test_sendShutdownChainFunds_revertOtherTokenHasNoChainBalance() public {
+        _deposit(chainId, amount);
+        TestnetERC20Token otherToken = new TestnetERC20Token("Other", "OTH", 18);
+        otherToken.mint(address(sharedBridge), amount);
+        _shutdownAndInstall(chainId);
+
+        vm.expectRevert("USDC-ShB: no chain balance");
+        sharedBridge.sendShutdownChainFunds(chainId, address(otherToken));
+        assertEq(otherToken.balanceOf(address(sharedBridge)), amount);
+    }
+
+    function test_sendShutdownChainFunds_revertPaused() public {
+        _deposit(chainId, amount);
+        _shutdownAndInstall(chainId);
         vm.prank(owner);
-        vm.expectRevert("USDC-ShB: recipient 0");
-        sharedBridge.shutdownChain(chainId, address(0));
-    }
+        sharedBridge.pause();
 
-    function test_shutdownChain_revertUnknownChain() public {
-        vm.prank(owner);
-        vm.expectRevert("USDC-ShB: l2 bridge not yet set");
-        sharedBridge.shutdownChain(12345, recipient);
-    }
-
-    function test_shutdownChain_revertTwice() public {
-        vm.startPrank(owner);
-        sharedBridge.shutdownChain(chainId, recipient);
-        vm.expectRevert("USDC-ShB: chain is shut down");
-        sharedBridge.shutdownChain(chainId, recipient);
-        vm.stopPrank();
+        vm.expectRevert("Pausable: paused");
+        sharedBridge.sendShutdownChainFunds(chainId, address(token));
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -180,8 +206,7 @@ contract L1USDCBridgeShutdownTest is L1USDCBridgeTest {
     //////////////////////////////////////////////////////////////*/
 
     function test_afterShutdown_depositReverts() public {
-        vm.prank(owner);
-        sharedBridge.shutdownChain(chainId, recipient);
+        assetTracker.shutdownChain(chainId, chainAdmin, address(distributor));
 
         token.mint(alice, amount);
         vm.prank(alice);
@@ -195,17 +220,17 @@ contract L1USDCBridgeShutdownTest is L1USDCBridgeTest {
         assertEq(sharedBridge.chainBalance(eraChainId, address(token)), amount);
     }
 
-    /// @dev Withdrawals revert with the shutdown error even when the bridge holds enough USDC for other chains.
+    /// @dev Withdrawals revert even though the chain's balance is still in the bridge.
     function test_afterShutdown_finalizeWithdrawalReverts() public {
         _deposit(chainId, amount);
         _deposit(eraChainId, amount);
-        vm.prank(owner);
-        sharedBridge.shutdownChain(chainId, recipient);
+        assetTracker.shutdownChain(chainId, chainAdmin, address(distributor));
 
         bytes memory message = _withdrawalMessage(amount);
         _mockWithdrawalProof(chainId, message);
         vm.expectRevert("USDC-ShB: chain is shut down");
         _finalizeWithdrawal(chainId, message);
+        assertEq(sharedBridge.chainBalance(chainId, address(token)), amount);
 
         // Withdrawals from the other chain still work.
         _mockWithdrawalProof(eraChainId, message);
@@ -216,13 +241,10 @@ contract L1USDCBridgeShutdownTest is L1USDCBridgeTest {
 
     function test_afterShutdown_claimFailedDepositReverts() public {
         _deposit(chainId, amount);
-        _deposit(eraChainId, amount);
         bytes32 txDataHash = keccak256(abi.encode(alice, address(token), amount));
         vm.prank(bridgehubAddress);
         sharedBridge.bridgehubConfirmL2Transaction(chainId, txDataHash, txHash);
-
-        vm.prank(owner);
-        sharedBridge.shutdownChain(chainId, recipient);
+        assetTracker.shutdownChain(chainId, chainAdmin, address(distributor));
 
         vm.mockCall(
             bridgehubAddress,
@@ -251,5 +273,6 @@ contract L1USDCBridgeShutdownTest is L1USDCBridgeTest {
             _merkleProof: merkleProof
         });
         assertEq(sharedBridge.depositHappened(chainId, txHash), txDataHash);
+        assertEq(sharedBridge.chainBalance(chainId, address(token)), amount);
     }
 }

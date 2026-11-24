@@ -53,8 +53,10 @@ interface IL1SharedBridge {
         uint256 indexed chainId, address indexed to, address indexed l1Token, uint256 amount
     );
 
-    /// @notice The owner closed the bridge for `chainId` and sent the chain's whole USDC balance to `recipient`.
-    event ChainShutdown(uint256 indexed chainId, address indexed recipient, uint256 amount);
+    /// @notice The balance of a chain that the governance shut down was sent to the chain's claim distributor.
+    event ShutdownChainFundsSent(
+        uint256 indexed chainId, address indexed l1Token, address indexed distributor, uint256 amount
+    );
 
     function isWithdrawalFinalized(uint256 _chainId, uint256 _l2BatchNumber, uint256 _l2MessageIndex)
         external
@@ -73,13 +75,12 @@ interface IL1SharedBridge {
         bytes32[] calldata _merkleProof
     ) external;
 
-    function isChainShutdown(uint256 _chainId) external view returns (bool);
-
-    /// @notice Permanently closes the bridge for one chain: sends the chain's whole USDC balance on the bridge to
-    /// `_recipient`, sets it to zero, and makes deposits, withdrawals and failed-deposit claims for the chain revert.
-    /// @param _chainId The chain to close the bridge for.
-    /// @param _recipient The address that receives the chain's USDC balance.
-    function shutdownChain(uint256 _chainId, address _recipient) external;
+    /// @notice Sends the whole balance of `_l1Token` that the bridge holds for a shut down chain to the chain's claim
+    /// distributor, as recorded in the L1 asset tracker. Callable by anyone.
+    /// @param _chainId The shut down chain.
+    /// @param _l1Token The token to send.
+    /// @return amount The amount sent.
+    function sendShutdownChainFunds(uint256 _chainId, address _l1Token) external returns (uint256 amount);
 
     function finalizeWithdrawal(
         uint256 _chainId,
